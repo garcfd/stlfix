@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>STL Fix</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; font-family: 'Segoe UI', system-ui, sans-serif; font-size: 13px; color: #e0e0e0; background: #1e1e1e; }
+#app { display: flex; flex-direction: column; height: 100%; }
+#toolbar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: #2d2d2d; border-bottom: 1px solid #444; flex-wrap: wrap; min-height: 40px; user-select: none; }
+#toolbar button { padding: 4px 12px; background: #3a3a3a; border: 1px solid #555; color: #e0e0e0; border-radius: 3px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+#toolbar button:hover { background: #4a4a4a; }
+#toolbar button:active { background: #555; }
+#toolbar button.primary { background: #0a6e3a; border-color: #0d8a4a; }
+#toolbar button.primary:hover { background: #0d8a4a; }
+#toolbar button.danger { background: #8a2020; border-color: #aa3030; }
+#toolbar button.danger:hover { background: #aa3030; }
+#toolbar button.active { background: #2a5a8a; border-color: #3a7aba; }
+#toolbar button.tri-active { background: #8a2020; border-color: #aa3030; }
+#toolbar button.tri-active:hover { background: #aa3030; }
+#toolbar .sep { width: 1px; height: 24px; background: #555; margin: 0 4px; }
+#toolbar .info { margin-left: auto; font-size: 12px; color: #999; }
+#toolbar label { display: flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; color: #ccc; }
+#toolbar input[type=checkbox] { cursor: pointer; }
+#viewport { flex: 1; position: relative; overflow: hidden; background: #111; }
+#viewport canvas { display: block; width: 100%; height: 100%; }
+#statusbar { display: flex; gap: 16px; padding: 4px 10px; background: #252525; border-top: 1px solid #444; font-size: 12px; color: #999; user-select: none; }
+#statusbar span { white-space: nowrap; }
+#selRect { position: absolute; border: 1px solid #4a9eff; background: rgba(74, 158, 255, 0.1); pointer-events: none; display: none; z-index: 10; }
+#edgeInfo { display: none; margin-left: 8px; padding: 2px 8px; background: #3a3a3a; border-radius: 3px; font-size: 12px; color: #ffa; align-items: center; gap: 8px; }
+#edgeInfo.show { display: inline-flex; }
+.toast { position: fixed; bottom: 50px; left: 50%; transform: translateX(-50%); padding: 8px 20px; background: #333; border: 1px solid #555; border-radius: 4px; font-size: 13px; color: #eee; z-index: 100; pointer-events: none; opacity: 0; transition: opacity 0.3s; }
+.toast.show { opacity: 1; }
+.toast.error { border-color: #a33; background: #442; }
+</style>
+</head>
+<body>
+<div id="app">
+<div id="toolbar">
+  <button id="btnLoad" class="primary">Load STL</button>
+  <input type="file" id="fileInput" accept=".stl" hidden>
+  <button id="btnSave" class="primary">Save STL</button>
+  <span class="sep"></span>
+  <button id="btnUndo" disabled>Undo</button>
+  <span class="sep"></span>
+  <button id="btnDelete" class="danger" disabled>Delete Selected</button>
+  <button id="btnFlipNormals" disabled>Flip Normals</button>
+  <button id="btnClearSel" disabled>Clear Sel</button>
+  <button id="btnCloseHoles">Close Holes</button>
+  <span class="sep"></span>
+  <button id="btnEdgeMode">Select Edges</button>
+  <div id="edgeInfo">
+    <span>Edges: <span id="edgeCount">0</span>/2 — auto-creates tri</span>
+    <button id="btnExitEdge">Exit</button>
+  </div>
+  <span class="sep"></span>
+  <label><input type="checkbox" id="chkWireframe"> Wire</label>
+  <label><input type="checkbox" id="chkNormals"> Normals</label>
+  <label><input type="checkbox" id="chkFreeEdges"> Free Edges</label>
+  <span class="info" id="infoText">No file</span>
+</div>
+<div id="viewport">
+  <div id="selRect"></div>
+</div>
+<div id="statusbar">
+  <span id="triCount">Tris: 0</span>
+  <span id="selCount">Sel: 0</span>
+  <span id="modeText">Mode: Select</span>
+  <span id="fileText" style="margin-left:auto;"></span>
+</div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ─── Toast ─────────────────────────────────────────────
+let toastTimer = null;
+function showToast(msg, isError = false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (isError ? ' error' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+// ─── STL Parser ───────────────────────────────────────
+function parseSTL(buffer, filename) {
+  const headerStr = new TextDecoder('ascii', { fatal: false }).decode(
+    new Uint8Array(buffer, 0, Math.min(80, buffer.byteLength))
+  );
+  const isAscii = /^solid\s/i.test(headerStr.trim());
+  if (isAscii) return parseASCII(buffer, filename);
+  return parseBinary(buffer, filename);
+}
+
+function parseASCII(buffer, filename) {
+  const text = new TextDecoder('ascii', { fatal: false }).decode(buffer);
+  const vertices = [];
+  const indices = [];
+  const vertMap = new Map();
+
+  function addVertex(v) {
+    const k = v.map(n => n.toFixed(6)).join(',');
+    if (vertMap.has(k)) return vertMap.get(k);
+    const idx = vertices.length / 3;
+    vertices.push(v[0], v[1], v[2]);
+    vertMap.set(k, idx);
+    return idx;
+  }
+
+  const triRegex = /vertex\s+(-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)\s+(-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)\s+(-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/gi;
+  const verts = [];
+  let match;
+  while ((match = triRegex.exec(text)) !== null) {
+    verts.push([parseFloat(match[1]), parseFloat(match[2]), parseFloat(match[3])]);
+    if (verts.length === 3) {
+      const i0 = addVertex(verts[0]);
+      const i1 = addVertex(verts[1]);
+      const i2 = addVertex(verts[2]);
+      if (i0 !== i1 && i1 !== i2 && i0 !== i2) indices.push(i0, i1, i2);
+      verts.length = 0;
+    }
+  }
+  return { vertices, indices, filename };
+}
+
+function parseBinary(buffer, filename) {
+  const dv = new DataView(buffer);
+  const numTris = dv.getUint32(80, true);
+  const vertices = [];
+  const indices = [];
+  const vertMap = new Map();
+  let offset = 84;
+
+  function addVertex(x, y, z) {
+    const k = [x, y, z].map(n => n.toFixed(6)).join(',');
+    if (vertMap.has(k)) return vertMap.get(k);
+    const idx = vertices.length / 3;
+    vertices.push(x, y, z);
+    vertMap.set(k, idx);
+    return idx;
+  }
+
+  for (let i = 0; i < numTris; i++) {
+    if (offset + 50 > buffer.byteLength) break;
+    offset += 12;
+    const v0 = addVertex(dv.getFloat32(offset, true), dv.getFloat32(offset + 4, true), dv.getFloat32(offset + 8, true));
+    const v1 = addVertex(dv.getFloat32(offset + 12, true), dv.getFloat32(offset + 16, true), dv.getFloat32(offset + 20, true));
+    const v2 = addVertex(dv.getFloat32(offset + 24, true), dv.getFloat32(offset + 28, true), dv.getFloat32(offset + 32, true));
+    if (v0 !== v1 && v1 !== v2 && v0 !== v2) indices.push(v0, v1, v2);
+    offset += 38;
+  }
+  return { vertices, indices, filename };
+}
+
+// ─── STL Exporter (Binary) ────────────────────────────
+function exportSTL(vertices, indices, filename) {
+  const triCount = indices.length / 3;
+  const header = `STL Fix Export - ${filename || 'mesh'}`.padEnd(80, '\0').slice(0, 80);
+  const buf = new ArrayBuffer(84 + triCount * 50);
+  const dv = new DataView(buf);
+  for (let i = 0; i < 80; i++) dv.setUint8(i, header.charCodeAt(i));
+  dv.setUint32(80, triCount, true);
+  let off = 84;
+  for (let t = 0; t < triCount; t++) {
+    const i0 = indices[t * 3], i1 = indices[t * 3 + 1], i2 = indices[t * 3 + 2];
+    const ax = vertices[i0 * 3], ay = vertices[i0 * 3 + 1], az = vertices[i0 * 3 + 2];
+    const bx = vertices[i1 * 3], by = vertices[i1 * 3 + 1], bz = vertices[i1 * 3 + 2];
+    const cx = vertices[i2 * 3], cy = vertices[i2 * 3 + 1], cz = vertices[i2 * 3 + 2];
+    const ux = bx - ax, uy = by - ay, uz = bz - az;
+    const vx = cx - ax, vy = cy - ay, vz = cz - az;
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    dv.setFloat32(off, nx / len, true);
+    dv.setFloat32(off + 4, ny / len, true);
+    dv.setFloat32(off + 8, nz / len, true);
+    dv.setFloat32(off + 12, ax, true);
+    dv.setFloat32(off + 16, ay, true);
+    dv.setFloat32(off + 20, az, true);
+    dv.setFloat32(off + 24, bx, true);
+    dv.setFloat32(off + 28, by, true);
+    dv.setFloat32(off + 32, bz, true);
+    dv.setFloat32(off + 36, cx, true);
+    dv.setFloat32(off + 40, cy, true);
+    dv.setFloat32(off + 44, cz, true);
+    dv.setUint16(off + 48, 0, true);
+    off += 50;
+  }
+  return new Blob([buf], { type: 'application/octet-stream' });
+}
+
+// ─── Application State ────────────────────────────────
+const state = {
+  vertices: [],
+  indices: [],
+  selectedTris: new Set(),
+  edges: [],
+  selectedEdges: [],
+  mode: 'select',
+  filename: 'untitled.stl',
+  dirty: false,
+  loaded: false,
+};
+let showFreeEdges = false;
+
+// ─── Undo History ─────────────────────────────────────
+const history = { stack: [], limit: 50 };
+function pushHistory() {
+  history.stack.push({
+    vertices: state.vertices.slice(),
+    indices: state.indices.slice(),
+  });
+  if (history.stack.length > history.limit) history.stack.shift();
+}
+function undo() {
+  if (history.stack.length === 0) return false;
+  const prev = history.stack.pop();
+  state.vertices = prev.vertices;
+  state.indices = prev.indices;
+  state.selectedTris.clear();
+  state.selectedEdges = [];
+  state.dirty = true;
+  return true;
+}
+
+// ─── Three.js Setup ───────────────────────────────────
+const container = document.getElementById('viewport');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+
+const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 10000);
+camera.position.set(50, 40, 80);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(container.clientWidth, container.clientHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+container.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.15;
+controls.minDistance = 1;
+controls.maxDistance = 5000;
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x404060, 0.6);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(60, 100, 80);
+dirLight.castShadow = false;
+scene.add(dirLight);
+
+const dirLight2 = new THREE.DirectionalLight(0x4488ff, 0.4);
+dirLight2.position.set(-60, -20, -40);
+scene.add(dirLight2);
+
+const hemiLight = new THREE.HemisphereLight(0x4466ff, 0x224422, 0.5);
+scene.add(hemiLight);
+
+// Grid + Axes
+const gridHelper = new THREE.GridHelper(200, 20, 0x444488, 0x333366);
+scene.add(gridHelper);
+
+const axesHelper = new THREE.AxesHelper(20);
+scene.add(axesHelper);
+
+// ─── Mesh Objects ─────────────────────────────────────
+let mesh = null;
+let highlightMesh = null;
+let edgeLines = null;
+let selectedEdgeLines = null;
+let normalLines = null;
+let freeEdgeLines = null;
+
+const matMesh = new THREE.MeshStandardMaterial({
+  color: 0x88aacc,
+  metalness: 0.1,
+  roughness: 0.6,
+  side: THREE.DoubleSide,
+  flatShading: true,
+  vertexColors: false,
+});
+
+const matHighlight = new THREE.MeshStandardMaterial({
+  color: 0xffaa44,
+  emissive: 0xff6600,
+  emissiveIntensity: 0.3,
+  side: THREE.DoubleSide,
+  flatShading: true,
+  transparent: true,
+  opacity: 0.35,
+  depthWrite: false,
+  polygonOffset: true,
+  polygonOffsetFactor: -1,
+});
+
+const matEdge = new THREE.LineBasicMaterial({ color: 0x222222 });
+const matEdgeSel = new THREE.LineBasicMaterial({ color: 0xffaa00, linewidth: 2 });
+
+const matNormal = new THREE.LineBasicMaterial({ color: 0x00ff88, transparent: true, opacity: 0.5 });
+const matFreeEdge = new THREE.LineBasicMaterial({ color: 0xff3333, linewidth: 2 });
+
+function buildScene(fit = true) {
+  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); mesh = null; }
+  if (highlightMesh) { scene.remove(highlightMesh); highlightMesh.geometry.dispose(); highlightMesh = null; }
+  if (edgeLines) { scene.remove(edgeLines); edgeLines.geometry.dispose(); edgeLines = null; }
+  if (selectedEdgeLines) { scene.remove(selectedEdgeLines); selectedEdgeLines.geometry.dispose(); selectedEdgeLines = null; }
+  if (normalLines) { scene.remove(normalLines); normalLines.geometry.dispose(); normalLines = null; }
+  if (freeEdgeLines) { scene.remove(freeEdgeLines); freeEdgeLines.geometry.dispose(); freeEdgeLines = null; }
+
+  if (state.indices.length === 0) {
+    updateUI();
+    return;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(state.vertices.slice(), 3));
+  geo.setIndex(new THREE.Uint32BufferAttribute(state.indices.slice(), 1));
+  geo.computeVertexNormals();
+
+  mesh = new THREE.Mesh(geo, matMesh);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+
+  // Normals visualization
+  if (document.getElementById('chkNormals').checked) {
+    buildNormals(geo);
+  }
+
+  // Edge lines
+  buildEdgeLines();
+  buildFreeEdges();
+
+  updateUI();
+  if (fit) fitCamera();
+}
+
+function buildEdgeLines() {
+  if (!mesh) return;
+  const pos = mesh.geometry.attributes.position;
+  const idx = mesh.geometry.index;
+  const edgeMap = new Map();
+  const edges = [];
+
+  for (let i = 0; i < idx.count; i += 3) {
+    const a = idx.getX(i), b = idx.getX(i + 1), c = idx.getX(i + 2);
+    const triEdges = [[a, b], [b, c], [c, a]];
+    for (const [e0, e1] of triEdges) {
+      const key = Math.min(e0, e1) + ',' + Math.max(e0, e1);
+      edgeMap.set(key, (edgeMap.get(key) || 0) + 1);
+    }
+  }
+
+  state.edges = [];
+  const edgePos = [];
+  const freeEdgePos = [];
+  for (const [key, count] of edgeMap) {
+    const [i, j] = key.split(',').map(Number);
+    const x1 = pos.getX(i), y1 = pos.getY(i), z1 = pos.getZ(i);
+    const x2 = pos.getX(j), y2 = pos.getY(j), z2 = pos.getZ(j);
+    edgePos.push(x1, y1, z1, x2, y2, z2);
+    state.edges.push({ a: i, b: j, count });
+    if (count < 2) freeEdgePos.push(x1, y1, z1, x2, y2, z2);
+  }
+
+  if (edgePos.length > 0) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(edgePos, 3));
+    edgeLines = new THREE.LineSegments(geo, matEdge);
+    edgeLines.visible = true;
+    scene.add(edgeLines);
+  }
+
+  state.freeEdgePos = freeEdgePos;
+}
+
+function buildFreeEdges() {
+  if (freeEdgeLines) { scene.remove(freeEdgeLines); freeEdgeLines.geometry.dispose(); freeEdgeLines = null; }
+  const freeEdgePos = state.freeEdgePos || [];
+  if (freeEdgePos.length > 0 && showFreeEdges) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(freeEdgePos, 3));
+    freeEdgeLines = new THREE.LineSegments(geo, matFreeEdge);
+    freeEdgeLines.renderOrder = 3;
+    scene.add(freeEdgeLines);
+  }
+}
+
+function buildNormals(geo) {
+  const pos = geo.attributes.position;
+  const idx = geo.index;
+  const nPos = [];
+  const v = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+  for (let i = 0; i < idx.count; i += 3) {
+    const i0 = idx.getX(i), i1 = idx.getX(i + 1), i2 = idx.getX(i + 2);
+    v[0].set(pos.getX(i0), pos.getY(i0), pos.getZ(i0));
+    v[1].set(pos.getX(i1), pos.getY(i1), pos.getZ(i1));
+    v[2].set(pos.getX(i2), pos.getY(i2), pos.getZ(i2));
+    const cx = (v[0].x + v[1].x + v[2].x) / 3;
+    const cy = (v[0].y + v[1].y + v[2].y) / 3;
+    const cz = (v[0].z + v[1].z + v[2].z) / 3;
+    const e1 = new THREE.Vector3().subVectors(v[1], v[0]);
+    const e2 = new THREE.Vector3().subVectors(v[2], v[0]);
+    const n = new THREE.Vector3().crossVectors(e1, e2).normalize();
+    const len = (v[0].distanceTo(v[1]) + v[1].distanceTo(v[2]) + v[2].distanceTo(v[0])) / 3;
+    nPos.push(cx, cy, cz, cx + n.x * len, cy + n.y * len, cz + n.z * len);
+  }
+  const nGeo = new THREE.BufferGeometry();
+  nGeo.setAttribute('position', new THREE.Float32BufferAttribute(nPos, 3));
+  normalLines = new THREE.LineSegments(nGeo, matNormal);
+  scene.add(normalLines);
+}
+
+function fitCamera() {
+  if (!mesh) return;
+  const box = new THREE.Box3().setFromObject(mesh);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z);
+  if (maxDim < 0.001) return;
+  const dist = maxDim * 1.8;
+  controls.target.copy(center);
+  camera.position.set(center.x + dist * 0.6, center.y + dist * 0.5, center.z + dist);
+  controls.update();
+}
+
+// ─── Highlight Selected ───────────────────────────────
+function updateHighlight() {
+  if (highlightMesh) {
+    scene.remove(highlightMesh);
+    highlightMesh.geometry.dispose();
+    highlightMesh = null;
+  }
+  if (state.selectedTris.size === 0 || !mesh) {
+    updateUI();
+    return;
+  }
+
+  const idx = mesh.geometry.index;
+  const pos = mesh.geometry.attributes.position;
+  const selVerts = [];
+  const selIdx = [];
+  let offset = 0;
+
+  const sorted = [...state.selectedTris].sort((a, b) => a - b);
+  for (const triIdx of sorted) {
+    if (triIdx * 3 + 2 >= idx.count) continue;
+    const i0 = idx.getX(triIdx * 3);
+    const i1 = idx.getX(triIdx * 3 + 1);
+    const i2 = idx.getX(triIdx * 3 + 2);
+    selVerts.push(pos.getX(i0), pos.getY(i0), pos.getZ(i0));
+    selVerts.push(pos.getX(i1), pos.getY(i1), pos.getZ(i1));
+    selVerts.push(pos.getX(i2), pos.getY(i2), pos.getZ(i2));
+    selIdx.push(offset, offset + 1, offset + 2);
+    offset += 3;
+  }
+
+  if (selVerts.length === 0) return;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(selVerts, 3));
+  geo.setIndex(new THREE.Uint32BufferAttribute(selIdx, 1));
+  geo.computeVertexNormals();
+  highlightMesh = new THREE.Mesh(geo, matHighlight);
+  highlightMesh.renderOrder = 1;
+  scene.add(highlightMesh);
+  updateUI();
+}
+
+// ─── Update Edge Select Visualization ─────────────────
+function updateEdgeVisuals() {
+  if (selectedEdgeLines) {
+    scene.remove(selectedEdgeLines);
+    selectedEdgeLines.geometry.dispose();
+    selectedEdgeLines = null;
+  }
+  if (state.selectedEdges.length === 0) return;
+  const pos = mesh.geometry.attributes.position;
+  const ePos = [];
+  for (const ei of state.selectedEdges) {
+    const e = state.edges[ei];
+    if (!e) continue;
+    ePos.push(pos.getX(e.a), pos.getY(e.a), pos.getZ(e.a));
+    ePos.push(pos.getX(e.b), pos.getY(e.b), pos.getZ(e.b));
+  }
+  if (ePos.length > 0) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(ePos, 3));
+    selectedEdgeLines = new THREE.LineSegments(geo, matEdgeSel);
+    selectedEdgeLines.renderOrder = 2;
+    scene.add(selectedEdgeLines);
+  }
+}
+
+// ─── Selection Logic ──────────────────────────────────
+function raycastSelect(event) {
+  if (!mesh || state.mode === 'edge') return false;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mx = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  const my = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2(mx, my);
+  raycaster.setFromCamera(mouse, camera);
+
+  const intersects = raycaster.intersectObject(mesh);
+  if (intersects.length === 0) return false;
+
+  const faceIdx = intersects[0].faceIndex;
+  if (faceIdx === undefined) return false;
+
+  const triIdx = faceIdx;
+  if (event.ctrlKey || event.metaKey) {
+    if (state.selectedTris.has(triIdx)) state.selectedTris.delete(triIdx);
+    else state.selectedTris.add(triIdx);
+  } else {
+    state.selectedTris.clear();
+    state.selectedTris.add(triIdx);
+  }
+  updateHighlight();
+  return true;
+}
+
+function rectSelect(x1, y1, x2, y2, e) {
+  if (!mesh) return;
+  const left = Math.min(x1, x2), right = Math.max(x1, x2);
+  const top = Math.min(y1, y2), bottom = Math.max(y1, y2);
+  const rect = renderer.domElement.getBoundingClientRect();
+  const w = rect.width, h = rect.height;
+
+  const pos = mesh.geometry.attributes.position;
+  const idx = mesh.geometry.index;
+  const vec = new THREE.Vector3();
+  const triCount = idx.count / 3;
+  const newlySelected = [];
+
+  for (let i = 0; i < triCount; i++) {
+    let anyInside = false;
+    for (let j = 0; j < 3; j++) {
+      const vi = idx.getX(i * 3 + j);
+      vec.set(pos.getX(vi), pos.getY(vi), pos.getZ(vi));
+      vec.project(camera);
+      const sx = (vec.x * 0.5 + 0.5) * w;
+      const sy = (-vec.y * 0.5 + 0.5) * h;
+      if (sx >= left && sx <= right && sy >= top && sy <= bottom) {
+        anyInside = true;
+        break;
+      }
+    }
+    if (anyInside) newlySelected.push(i);
+  }
+
+  if (e && (e.ctrlKey || e.metaKey)) {
+    for (const ti of newlySelected) state.selectedTris.add(ti);
+  } else {
+    state.selectedTris.clear();
+    for (const ti of newlySelected) state.selectedTris.add(ti);
+  }
+  updateHighlight();
+}
+
+// ─── Edge Selection ───────────────────────────────────
+function pickEdge(event) {
+  if (!mesh || state.mode !== 'edge') return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mx = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  const my = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2(mx, my);
+  raycaster.setFromCamera(mouse, camera);
+
+  const pos = mesh.geometry.attributes.position;
+  const dir = raycaster.ray.direction;
+  const origin = raycaster.ray.origin;
+
+  let bestDist = Infinity;
+  let bestEdge = -1;
+  const threshold = 5;
+
+  for (let i = 0; i < state.edges.length; i++) {
+    const e = state.edges[i];
+    const ax = pos.getX(e.a), ay = pos.getY(e.a), az = pos.getZ(e.a);
+    const bx = pos.getX(e.b), by = pos.getY(e.b), bz = pos.getZ(e.b);
+
+    const d = distToSegment(origin, dir, new THREE.Vector3(ax, ay, az), new THREE.Vector3(bx, by, bz));
+    if (d < bestDist) { bestDist = d; bestEdge = i; }
+  }
+
+  if (bestEdge >= 0 && bestDist < threshold) {
+    const idx = state.selectedEdges.indexOf(bestEdge);
+    if (idx >= 0) state.selectedEdges.splice(idx, 1);
+    else if (state.selectedEdges.length < 2) state.selectedEdges.push(bestEdge);
+    updateEdgeVisuals();
+    updateUI();
+    if (state.selectedEdges.length === 2) {
+      setTimeout(createTriangleFromEdges, 0);
+    }
+  }
+}
+
+function distToSegment(origin, dir, a, b) {
+  const ba = new THREE.Vector3().subVectors(b, a);
+  const oa = new THREE.Vector3().subVectors(origin, a);
+  const dCrossBa = new THREE.Vector3().crossVectors(dir, ba);
+  const num = Math.abs(dCrossBa.dot(oa));
+  const den = dCrossBa.length();
+  if (den < 1e-10) return Infinity;
+  const d = num / den;
+
+  const t = -new THREE.Vector3().crossVectors(oa, ba).dot(dCrossBa) / (den * den);
+  const p = new THREE.Vector3().copy(origin).addScaledVector(dir, t);
+  const tLine = new THREE.Vector3().subVectors(p, a).dot(ba) / ba.lengthSq();
+  if (tLine < 0 || tLine > 1) {
+    const da = origin.distanceTo(a);
+    const db = origin.distanceTo(b);
+    return Math.min(da, db);
+  }
+  return d;
+}
+
+// ─── Create Triangle from Edges ───────────────────────
+function createTriangleFromEdges() {
+  if (state.selectedEdges.length < 2) return;
+  const e1 = state.edges[state.selectedEdges[0]];
+  const e2 = state.edges[state.selectedEdges[1]];
+  if (!e1 || !e2) return;
+
+  const vidx = new Set([e1.a, e1.b, e2.a, e2.b]);
+  if (vidx.size < 3) { showToast('Edges share too many vertices', true); return; }
+
+  pushHistory();
+  if (vidx.size === 3) {
+    const verts = [...vidx];
+    const tri = [verts[0], verts[1], verts[2]];
+    state.indices.push(...tri);
+    state.dirty = true;
+    showToast(`Added 1 triangle`);
+  } else {
+    state.indices.push(e1.a, e1.b, e2.a);
+    state.indices.push(e1.b, e2.a, e2.b);
+    state.dirty = true;
+    showToast(`Added 2 triangles`);
+  }
+
+  state.selectedEdges = [];
+  buildScene(false);
+}
+
+// ─── Flip Normals ─────────────────────────────────────
+function flipNormals() {
+  if (state.selectedTris.size === 0) return;
+  pushHistory();
+  const sel = new Set(state.selectedTris);
+  for (const triIdx of sel) {
+    const i = triIdx * 3;
+    const tmp = state.indices[i + 1];
+    state.indices[i + 1] = state.indices[i + 2];
+    state.indices[i + 2] = tmp;
+  }
+  state.selectedTris.clear();
+  state.dirty = true;
+  showToast('Flipped normals');
+  buildScene(false);
+}
+
+// ─── Close Holes ──────────────────────────────────────
+function closeHoles() {
+  const freeEdges = state.edges.filter(e => e.count < 2);
+  if (freeEdges.length === 0) { showToast('No holes found (no free edges)', true); return; }
+
+  const adj = new Map();
+  for (const e of freeEdges) {
+    if (!adj.has(e.a)) adj.set(e.a, []);
+    if (!adj.has(e.b)) adj.set(e.b, []);
+    adj.get(e.a).push(e.b);
+    adj.get(e.b).push(e.a);
+  }
+
+  const used = new Set();
+  const loops = [];
+
+  for (const e of freeEdges) {
+    const key = e.a < e.b ? `${e.a},${e.b}` : `${e.b},${e.a}`;
+    if (used.has(key)) continue;
+
+    const loop = [e.a, e.b];
+    used.add(key);
+    let prev = e.a, curr = e.b;
+
+    while (curr !== e.a) {
+      const neighbors = adj.get(curr).filter(n => {
+        if (n === prev) return false;
+        const k = curr < n ? `${curr},${n}` : `${n},${curr}`;
+        return !used.has(k);
+      });
+      if (neighbors.length === 0) break;
+      const next = neighbors[0];
+      const nk = curr < next ? `${curr},${next}` : `${next},${curr}`;
+      used.add(nk);
+      loop.push(next);
+      prev = curr;
+      curr = next;
+    }
+
+    if (loop.length >= 4) loops.push(loop.slice(0, -1));
+  }
+
+  if (loops.length === 0) { showToast('Could not trace hole boundaries', true); return; }
+
+  let added = 0;
+  pushHistory();
+  for (const loop of loops) {
+    const tris = triangulateLoop(loop);
+    state.indices.push(...tris);
+    added += tris.length / 3;
+  }
+  state.selectedTris.clear();
+  state.selectedEdges = [];
+  state.dirty = true;
+  showToast(`Closed ${loops.length} hole(s), added ${added} triangle(s)`);
+  buildScene(false);
+}
+
+function triangulateLoop(loop) {
+  const n = loop.length;
+  if (n < 3) return [];
+  if (n === 3) return [loop[0], loop[1], loop[2]];
+
+  const pos = loop.map(i => [
+    state.vertices[i * 3], state.vertices[i * 3 + 1], state.vertices[i * 3 + 2]
+  ]);
+
+  let nx = 0, ny = 0, nz = 0;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    nx += (pos[i][1] - pos[j][1]) * (pos[i][2] + pos[j][2]);
+    ny += (pos[i][2] - pos[j][2]) * (pos[i][0] + pos[j][0]);
+    nz += (pos[i][0] - pos[j][0]) * (pos[i][1] + pos[j][1]);
+  }
+
+  const absN = [Math.abs(nx), Math.abs(ny), Math.abs(nz)];
+  let pts2D;
+  if (absN[0] >= absN[1] && absN[0] >= absN[2]) pts2D = pos.map(p => [p[1], p[2]]);
+  else if (absN[1] >= absN[0] && absN[1] >= absN[2]) pts2D = pos.map(p => [p[0], p[2]]);
+  else pts2D = pos.map(p => [p[0], p[1]]);
+
+  let area2 = 0;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    area2 += pts2D[i][0] * pts2D[j][1] - pts2D[j][0] * pts2D[i][1];
+  }
+
+  const order = [];
+  for (let i = 0; i < n; i++) order.push(i);
+  if (area2 < 0) order.reverse();
+
+  const result = [];
+  let rem = [...order];
+
+  while (rem.length > 3) {
+    let found = false;
+    for (let i = 0; i < rem.length; i++) {
+      const prv = rem[(i - 1 + rem.length) % rem.length];
+      const cur = rem[i];
+      const nxt = rem[(i + 1) % rem.length];
+      const p = pts2D[prv], c = pts2D[cur], n = pts2D[nxt];
+      const cross = (c[0] - p[0]) * (n[1] - c[1]) - (c[1] - p[1]) * (n[0] - c[0]);
+      if (cross <= 0) continue;
+      let inside = false;
+      for (const v of rem) {
+        if (v === prv || v === cur || v === nxt) continue;
+        const d1 = (pts2D[v][0] - p[0]) * (c[1] - p[1]) - (c[0] - p[0]) * (pts2D[v][1] - p[1]);
+        const d2 = (pts2D[v][0] - c[0]) * (n[1] - c[1]) - (n[0] - c[0]) * (pts2D[v][1] - c[1]);
+        const d3 = (pts2D[v][0] - n[0]) * (p[1] - n[1]) - (p[0] - n[0]) * (pts2D[v][1] - n[1]);
+        if (!((d1 < 0) || (d2 < 0) || (d3 < 0)) || !((d1 > 0) || (d2 > 0) || (d3 > 0))) { inside = true; break; }
+      }
+      if (inside) continue;
+      result.push(loop[prv], loop[cur], loop[nxt]);
+      rem.splice(i, 1);
+      found = true;
+      break;
+    }
+    if (!found) {
+      rem = [...order];
+      result.length = 0;
+      for (let i = 1; i < rem.length - 1; i++) result.push(loop[rem[0]], loop[rem[i]], loop[rem[i + 1]]);
+      return result;
+    }
+  }
+  if (rem.length === 3) result.push(loop[rem[0]], loop[rem[1]], loop[rem[2]]);
+  return result;
+}
+
+// ─── Delete Selected ──────────────────────────────────
+function deleteSelected() {
+  if (state.selectedTris.size === 0 || !mesh) return;
+  const deleteSet = new Set(state.selectedTris);
+  const newIdx = [];
+  const idx = mesh.geometry.index;
+  const triCount = idx.count / 3;
+  for (let i = 0; i < triCount; i++) {
+    if (!deleteSet.has(i)) {
+      newIdx.push(idx.getX(i * 3), idx.getX(i * 3 + 1), idx.getX(i * 3 + 2));
+    }
+  }
+  if (newIdx.length === 0) { showToast('Cannot delete all triangles', true); return; }
+  pushHistory();
+  state.indices = newIdx;
+  state.selectedTris.clear();
+  state.dirty = true;
+  showToast(`Deleted ${deleteSet.size} triangle(s)`);
+  buildScene(false);
+}
+
+// ─── File Operations ──────────────────────────────────
+async function loadFile(file) {
+  try {
+    const buf = await file.arrayBuffer();
+    const result = parseSTL(buf, file.name);
+    if (result.indices.length === 0) { showToast('No valid triangles found', true); return; }
+    state.vertices = result.vertices;
+    state.indices = result.indices;
+    state.filename = result.filename;
+    state.selectedTris.clear();
+    state.selectedEdges = [];
+    state.mode = 'select';
+    state.dirty = false;
+    state.loaded = true;
+    document.getElementById('btnEdgeMode').classList.remove('active');
+    document.getElementById('edgeInfo').classList.remove('show');
+    buildScene();
+    showToast(`Loaded ${state.indices.length / 3} triangles from ${file.name}`);
+  } catch (e) {
+    showToast('Error loading file: ' + e.message, true);
+    console.error(e);
+  }
+}
+
+function saveFile() {
+  if (!state.loaded || state.indices.length === 0) { showToast('Nothing to save', true); return; }
+  const blob = exportSTL(state.vertices, state.indices, state.filename);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const name = state.filename.replace(/\.stl$/i, '') + '_fixed.stl';
+  a.href = url; a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  state.dirty = false;
+  showToast(`Saved as ${name}`);
+}
+
+// ─── UI Updates ───────────────────────────────────────
+function updateUI() {
+  const triCount = state.indices.length / 3 || 0;
+  document.getElementById('triCount').textContent = `Tris: ${triCount}`;
+  document.getElementById('selCount').textContent = `Sel: ${state.selectedTris.size}`;
+  document.getElementById('modeText').textContent = `Mode: ${state.mode === 'edge' ? 'Edge' : 'Select'}`;
+  document.getElementById('fileText').textContent = state.loaded ? state.filename : '';
+  document.getElementById('infoText').textContent = state.loaded ? `${triCount} tris` : 'No file';
+
+  document.getElementById('btnUndo').disabled = history.stack.length === 0;
+
+  const hasSel = state.selectedTris.size > 0;
+  document.getElementById('btnDelete').disabled = !hasSel || state.mode === 'edge';
+  document.getElementById('btnFlipNormals').disabled = !hasSel || state.mode === 'edge';
+  document.getElementById('btnClearSel').disabled = !hasSel;
+
+  document.getElementById('edgeCount').textContent = state.selectedEdges.length;
+
+  const isEdgeMode = state.mode === 'edge';
+  document.getElementById('btnEdgeMode').classList.toggle('active', isEdgeMode);
+  document.getElementById('btnEdgeMode').classList.toggle('tri-active', !isEdgeMode);
+  document.getElementById('btnEdgeMode').textContent = isEdgeMode ? 'Select Edges' : 'Select Tris';
+  document.getElementById('edgeInfo').classList.toggle('show', isEdgeMode);
+}
+
+// ─── Rectangle Selection DOM ──────────────────────────
+const selRectEl = document.getElementById('selRect');
+let isRectSelecting = false;
+let rectStartX = 0, rectStartY = 0;
+
+function startRect(event) {
+  if (!mesh || state.mode === 'edge') return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  rectStartX = event.clientX - rect.left;
+  rectStartY = event.clientY - rect.top;
+  isRectSelecting = true;
+  selRectEl.style.display = 'block';
+  selRectEl.style.left = rectStartX + 'px';
+  selRectEl.style.top = rectStartY + 'px';
+  selRectEl.style.width = '0px';
+  selRectEl.style.height = '0px';
+  controls.enabled = false;
+}
+
+function moveRect(event) {
+  if (!isRectSelecting) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  let cx = event.clientX - rect.left, cy = event.clientY - rect.top;
+  selRectEl.style.left = Math.min(rectStartX, cx) + 'px';
+  selRectEl.style.top = Math.min(rectStartY, cy) + 'px';
+  selRectEl.style.width = Math.abs(cx - rectStartX) + 'px';
+  selRectEl.style.height = Math.abs(cy - rectStartY) + 'px';
+}
+
+function endRect(event) {
+  if (!isRectSelecting) return;
+  isRectSelecting = false;
+  selRectEl.style.display = 'none';
+  controls.enabled = true;
+
+  const rect = renderer.domElement.getBoundingClientRect();
+  const cx = event.clientX - rect.left, cy = event.clientY - rect.top;
+  const dx = Math.abs(cx - rectStartX), dy = Math.abs(cy - rectStartY);
+  if (dx > 3 && dy > 3) {
+    rectSelect(rectStartX, rectStartY, cx, cy, event);
+  }
+}
+
+// ─── Pointer Event Handling ───────────────────────────
+let pointerDownPos = { x: 0, y: 0, time: 0 };
+let isPointerDown = false;
+
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  pointerDownPos.x = e.clientX;
+  pointerDownPos.y = e.clientY;
+  pointerDownPos.time = performance.now();
+  isPointerDown = true;
+
+  if (e.shiftKey && state.mode === 'select') {
+    startRect(e);
+    e.preventDefault();
+  }
+});
+
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (isRectSelecting) moveRect(e);
+});
+
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (isRectSelecting) { endRect(e); isPointerDown = false; return; }
+  if (!isPointerDown) { isPointerDown = false; return; }
+  isPointerDown = false;
+
+  const dx = Math.abs(e.clientX - pointerDownPos.x);
+  const dy = Math.abs(e.clientY - pointerDownPos.y);
+  const dt = performance.now() - pointerDownPos.time;
+
+  if (dx < 5 && dy < 5 && dt < 500) {
+    if (state.mode === 'edge') pickEdge(e);
+    else raycastSelect(e);
+  }
+});
+
+// ─── Keyboard Shortcuts ───────────────────────────────
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (state.mode === 'select') deleteSelected();
+  }
+  if (e.key === 'e' || e.key === 'E') toggleEdgeMode();
+  if (e.key === 'Escape') {
+    state.selectedTris.clear();
+    state.selectedEdges = [];
+    updateHighlight();
+    updateEdgeVisuals();
+    updateUI();
+  }
+  if (e.key === 'z' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    if (undo()) buildScene(false);
+    updateUI();
+  }
+  if (e.key === 's' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    saveFile();
+  }
+  if (e.key === 'o' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    document.getElementById('fileInput').click();
+  }
+});
+
+// ─── UI Event Bindings ────────────────────────────────
+document.getElementById('btnLoad').addEventListener('click', () => {
+  document.getElementById('fileInput').click();
+});
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  if (e.target.files.length > 0) loadFile(e.target.files[0]);
+  e.target.value = '';
+});
+
+document.getElementById('btnSave').addEventListener('click', saveFile);
+
+document.getElementById('btnDelete').addEventListener('click', deleteSelected);
+
+document.getElementById('btnClearSel').addEventListener('click', () => {
+  state.selectedTris.clear();
+  updateHighlight();
+  updateUI();
+});
+
+function toggleEdgeMode() {
+  if (!state.loaded) return;
+  if (state.mode === 'edge') {
+    state.mode = 'select';
+    state.selectedEdges = [];
+    updateEdgeVisuals();
+  } else {
+    state.mode = 'edge';
+    state.selectedTris.clear();
+    updateHighlight();
+    buildEdgeLines();
+  }
+  updateUI();
+}
+
+document.getElementById('btnEdgeMode').addEventListener('click', toggleEdgeMode);
+
+document.getElementById('btnExitEdge').addEventListener('click', () => {
+  state.mode = 'select';
+  state.selectedEdges = [];
+  updateEdgeVisuals();
+  updateUI();
+});
+
+document.getElementById('btnUndo').addEventListener('click', () => {
+  if (undo()) buildScene(false);
+  updateUI();
+});
+
+document.getElementById('btnFlipNormals').addEventListener('click', flipNormals);
+document.getElementById('btnCloseHoles').addEventListener('click', closeHoles);
+
+document.getElementById('chkWireframe').addEventListener('change', (e) => {
+  if (mesh) matMesh.wireframe = e.target.checked;
+});
+
+document.getElementById('chkNormals').addEventListener('change', () => {
+  buildScene(false);
+});
+
+document.getElementById('chkFreeEdges').addEventListener('change', (e) => {
+  showFreeEdges = e.target.checked;
+  if (mesh) {
+    if (showFreeEdges) buildFreeEdges();
+    else { scene.remove(freeEdgeLines); freeEdgeLines.geometry.dispose(); freeEdgeLines = null; }
+  }
+});
+
+// ─── Resize ───────────────────────────────────────────
+function onResize() {
+  const w = container.clientWidth, h = container.clientHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+}
+window.addEventListener('resize', onResize);
+
+// ─── Render Loop ──────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// ─── Drag and Drop ────────────────────────────────────
+container.addEventListener('dragover', (e) => { e.preventDefault(); });
+container.addEventListener('drop', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer.files.length > 0) loadFile(e.dataTransfer.files[0]);
+});
+
+// Initial fit
+onResize();
+
+// Load sphere.stl on startup
+{
+  const el = document.getElementById('toast');
+  el.textContent = 'Drop an STL file or click Load STL';
+  el.className = 'toast show';
+  setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+console.log('STL Fix ready — drop a .stl file to begin');
+</script>
+</body>
+</html>
