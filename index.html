@@ -44,9 +44,12 @@ html, body { height: 100%; overflow: hidden; font-family: 'Segoe UI', system-ui,
   <button id="btnUndo" disabled>Undo</button>
   <span class="sep"></span>
   <button id="btnCloseHoles">Close Holes</button>
+  <button id="btnSplitEdge" disabled>Split Edge</button>
   <span class="sep"></span>
   <button id="btnResetView">Reset View</button>
+  <button id="btnZoomWin">Zoom Window</button>
   <button id="btnSetCenter" title="Click on the mesh to set the rotation centre">Pick Centre</button>
+  <button id="btnProjection">Perspective</button>
   <span class="sep"></span>
   <button id="btnSelTris" class="tri-active">Select Tris</button>
   <button id="btnSelEdges">Select Edges</button>
@@ -207,6 +210,7 @@ const state = {
 let showFreeEdges = false;
 let showWireframe = false;
 let pickingCenter = false;
+let isZoomWindowing = false;
 const savedCamQuat = new THREE.Quaternion();
 let savedCamQuatValid = false;
 
@@ -229,12 +233,15 @@ function undo() {
   return true;
 }
 
+const _v = new THREE.Vector3();
 const container = document.getElementById('viewport');
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x2a2a3e);
 
+let isPerspective = true;
 const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 10000);
 camera.position.set(50, 40, 80);
+let perspFov = 45;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(container.clientWidth, container.clientHeight);
@@ -255,12 +262,11 @@ scene.add(ambientLight);
 
 const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
 dirLight.position.set(10, 20, 15);
-camera.add(dirLight);
-scene.add(camera);
+scene.add(dirLight);
 
 const dirLight2 = new THREE.DirectionalLight(0x88aaff, 0.4);
 dirLight2.position.set(-10, 5, -15);
-camera.add(dirLight2);
+scene.add(dirLight2);
 
 const hemiLight = new THREE.HemisphereLight(0x6688ff, 0x446644, 0.6);
 scene.add(hemiLight);
@@ -301,6 +307,10 @@ const matEdge = new THREE.LineBasicMaterial({ color: 0x222222 });
 const matEdgeSel = new THREE.LineBasicMaterial({ color: 0xffaa00 });
 const matFreeEdge = new THREE.LineBasicMaterial({ color: 0xff3333 });
 const matWireframe = new THREE.LineBasicMaterial({ color: 0xffffff });
+const matEdgeHover = new THREE.LineBasicMaterial({ color: 0x00ff88 });
+
+let hoveredEdgeLine = null;
+let hoveredEdgeIdx = -1;
 
 function buildScene(fit = true) {
   if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); mesh = null; }
@@ -309,6 +319,7 @@ function buildScene(fit = true) {
   if (selectedEdgeLines) { scene.remove(selectedEdgeLines); selectedEdgeLines.geometry.dispose(); selectedEdgeLines = null; }
   if (freeEdgeLines) { scene.remove(freeEdgeLines); freeEdgeLines.geometry.dispose(); freeEdgeLines = null; }
   if (wireframeLines) { scene.remove(wireframeLines); wireframeLines.geometry.dispose(); wireframeLines = null; }
+  if (hoveredEdgeLine) { clearEdgeHover(); }
 
   if (state.indices.length === 0) { updateUI(); return; }
 
@@ -419,7 +430,7 @@ function fitCamera() {
 function updateCenterMarker() {
   if (centerMarker) { scene.remove(centerMarker); centerMarker.geometry.dispose(); centerMarker = null; }
   const t = controls.target;
-  const s = 0.3;
+  const s = 0.15;
   const pts = [t.x-s,t.y,t.z, t.x+s,t.y,t.z, t.x,t.y-s,t.z, t.x,t.y+s,t.z, t.x,t.y,t.z-s, t.x,t.y,t.z+s];
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
@@ -440,7 +451,7 @@ function pickCenter(event) {
   const mx = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   const my = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   const raycaster = new THREE.Raycaster();
-  raycaster.setFromCamera(new THREE.Vector2(mx, my), camera);
+  setRaycasterFromCam(raycaster, new THREE.Vector2(mx, my));
   const intersects = raycaster.intersectObject(mesh);
   if (intersects.length === 0) {
     showToast('Click the mesh to set the centre', true);
@@ -519,13 +530,25 @@ function updateEdgeVisuals() {
   }
 }
 
+function setRaycasterFromCam(raycaster, coords) {
+  if (isPerspective) {
+    raycaster.setFromCamera(coords, camera);
+  } else {
+    camera.isOrthographicCamera = true;
+    camera.isPerspectiveCamera = false;
+    raycaster.setFromCamera(coords, camera);
+    camera.isOrthographicCamera = false;
+    camera.isPerspectiveCamera = true;
+  }
+}
+
 function raycastSelect(event) {
   if (!mesh || state.mode === 'edge') return false;
   const rect = renderer.domElement.getBoundingClientRect();
   const mx = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   const my = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   const raycaster = new THREE.Raycaster();
-  raycaster.setFromCamera(new THREE.Vector2(mx, my), camera);
+  setRaycasterFromCam(raycaster, new THREE.Vector2(mx, my));
   const intersects = raycaster.intersectObject(mesh);
   if (intersects.length === 0) return false;
   const faceIdx = intersects[0].faceIndex;
@@ -574,13 +597,29 @@ function rectSelect(x1, y1, x2, y2, e) {
   updateHighlight();
 }
 
+function paintSelect(event) {
+  if (!mesh) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mx = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  const my = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  const raycaster = new THREE.Raycaster();
+  setRaycasterFromCam(raycaster, new THREE.Vector2(mx, my));
+  const hits = raycaster.intersectObject(mesh);
+  if (hits.length === 0) return;
+  const triIdx = hits[0].faceIndex;
+  if (triIdx === undefined || triIdx === lastPaintTri) return;
+  lastPaintTri = triIdx;
+  state.selectedTris.add(triIdx);
+  updateHighlight();
+}
+
 function pickEdge(event) {
   if (!mesh || state.mode !== 'edge') return;
   const rect = renderer.domElement.getBoundingClientRect();
   const mx = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   const my = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   const raycaster = new THREE.Raycaster();
-  raycaster.setFromCamera(new THREE.Vector2(mx, my), camera);
+  setRaycasterFromCam(raycaster, new THREE.Vector2(mx, my));
   const pos = mesh.geometry.attributes.position;
   const dir = raycaster.ray.direction;
   const origin = raycaster.ray.origin;
@@ -601,6 +640,50 @@ function pickEdge(event) {
     updateEdgeVisuals();
     updateUI();
     if (state.selectedEdges.length === 2) setTimeout(createTriangleFromEdges, 0);
+  }
+}
+
+function clearEdgeHover() {
+  if (hoveredEdgeLine) {
+    scene.remove(hoveredEdgeLine);
+    hoveredEdgeLine.geometry.dispose();
+    hoveredEdgeLine = null;
+  }
+  hoveredEdgeIdx = -1;
+}
+
+function updateEdgeHover(event) {
+  if (!mesh || state.mode !== 'edge') { clearEdgeHover(); return; }
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mx = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  const my = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  const raycaster = new THREE.Raycaster();
+  setRaycasterFromCam(raycaster, new THREE.Vector2(mx, my));
+  const pos = mesh.geometry.attributes.position;
+  const dir = raycaster.ray.direction;
+  const origin = raycaster.ray.origin;
+  let bestDist = Infinity;
+  let bestEdge = -1;
+  const threshold = 5;
+  for (let i = 0; i < state.edges.length; i++) {
+    const e = state.edges[i];
+    const ax = pos.getX(e.a), ay = pos.getY(e.a), az = pos.getZ(e.a);
+    const bx = pos.getX(e.b), by = pos.getY(e.b), bz = pos.getZ(e.b);
+    const d = distToSegment(origin, dir, new THREE.Vector3(ax, ay, az), new THREE.Vector3(bx, by, bz));
+    if (d < bestDist) { bestDist = d; bestEdge = i; }
+  }
+  if (bestEdge === hoveredEdgeIdx) return;
+  clearEdgeHover();
+  if (bestEdge >= 0 && bestDist < threshold) {
+    const e = state.edges[bestEdge];
+    const ax = pos.getX(e.a), ay = pos.getY(e.a), az = pos.getZ(e.a);
+    const bx = pos.getX(e.b), by = pos.getY(e.b), bz = pos.getZ(e.b);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute([ax, ay, az, bx, by, bz], 3));
+    hoveredEdgeLine = new THREE.LineSegments(geo, matEdgeHover);
+    hoveredEdgeLine.renderOrder = 3;
+    scene.add(hoveredEdgeLine);
+    hoveredEdgeIdx = bestEdge;
   }
 }
 
@@ -748,6 +831,49 @@ function deleteSelected() {
   buildScene(false);
 }
 
+function splitEdge() {
+  if (!mesh || state.mode !== 'edge' || state.selectedEdges.length === 0) return;
+  const ei = state.selectedEdges[0];
+  const e = state.edges[ei];
+  if (!e) return;
+  const a = e.a, b = e.b;
+  const ax = state.vertices[a * 3], ay = state.vertices[a * 3 + 1], az = state.vertices[a * 3 + 2];
+  const bx = state.vertices[b * 3], by = state.vertices[b * 3 + 1], bz = state.vertices[b * 3 + 2];
+  const mx = (ax + bx) / 2, my = (ay + by) / 2, mz = (az + bz) / 2;
+  const midIdx = state.vertices.length / 3;
+  state.vertices.push(mx, my, mz);
+  const newIdx = [];
+  const idx = state.indices;
+  const triCount = idx.length / 3;
+  let splitCount = 0;
+  for (let i = 0; i < triCount; i++) {
+    const i0 = idx[i * 3], i1 = idx[i * 3 + 1], i2 = idx[i * 3 + 2];
+    if ((i0 === a && i1 === b) || (i0 === b && i1 === a)) {
+      newIdx.push(i0, midIdx, i2);
+      newIdx.push(midIdx, i1, i2);
+      splitCount++;
+    } else if ((i1 === a && i2 === b) || (i1 === b && i2 === a)) {
+      newIdx.push(i0, i1, midIdx);
+      newIdx.push(i0, midIdx, i2);
+      splitCount++;
+    } else if ((i2 === a && i0 === b) || (i2 === b && i0 === a)) {
+      newIdx.push(i1, i2, midIdx);
+      newIdx.push(i1, midIdx, i0);
+      splitCount++;
+    } else {
+      newIdx.push(i0, i1, i2);
+    }
+  }
+  if (splitCount === 0) { showToast('Edge not found in any triangle', true); return; }
+  pushHistory();
+  state.indices = newIdx;
+  state.selectedEdges = [];
+  state.selectedTris.clear();
+  state.dirty = true;
+  showToast('Split edge: ' + splitCount + ' triangle(s) subdivided');
+  buildScene(false);
+}
+
 async function loadFile(file) {
   try {
     const buf = await file.arrayBuffer();
@@ -778,24 +904,44 @@ async function loadFile(file) {
 
 function saveFile() {
   if (!state.loaded || state.indices.length === 0) { showToast('Nothing to save', true); return; }
-  const blob = exportSTL(state.vertices, state.indices, state.filename);
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  const name = state.filename.replace(/\.stl$/i, '') + '_fixed.stl';
-  a.href = url; a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-  state.dirty = false;
-  showToast('Saved as ' + name);
+  const defaultName = state.filename.replace(/\.stl$/i, '') + '_fixed.stl';
+  const blob = exportSTL(state.vertices, state.indices, defaultName);
+  if ('showSaveFilePicker' in window) {
+    (async () => {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: defaultName,
+          types: [{ description: 'STL File', accept: { 'model/stl': ['.stl'] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        state.dirty = false;
+        showToast('Saved as ' + handle.name);
+      } catch (e) {
+        if (e.name !== 'AbortError') showToast('Save cancelled or failed', true);
+      }
+    })();
+  } else {
+    const name = prompt('Save as:', defaultName);
+    if (!name) return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    state.dirty = false;
+    showToast('Saved as ' + name);
+  }
 }
 
 function updateUI() {
   const triCount = state.indices.length / 3 || 0;
   document.getElementById('triCount').textContent = 'Tris: ' + triCount;
   document.getElementById('selCount').textContent = 'Sel: ' + state.selectedTris.size;
-  document.getElementById('modeText').textContent = 'Mode: ' + (pickingCenter ? 'Pick Centre' : state.mode === 'edge' ? 'Edge' : 'Select');
+  document.getElementById('modeText').textContent = 'Mode: ' + (pickingCenter ? 'Pick Centre' : isZoomWindowing ? 'Zoom Window' : state.mode === 'edge' ? 'Edge' : 'Select');
   document.getElementById('fileText').textContent = state.loaded ? state.filename : '';
   document.getElementById('infoText').textContent = state.loaded ? triCount + ' tris' : 'No file';
 
@@ -804,6 +950,13 @@ function updateUI() {
   document.getElementById('btnSetCenter').className = pickingCenter ? 'active' : '';
 
   document.getElementById('btnCloseHoles').disabled = !state.loaded;
+  document.getElementById('btnSplitEdge').disabled = !state.loaded || state.mode !== 'edge' || state.selectedEdges.length === 0;
+
+  document.getElementById('btnZoomWin').className = isZoomWindowing ? 'active' : '';
+  document.getElementById('btnZoomWin').disabled = !state.loaded;
+
+  document.getElementById('btnProjection').textContent = isPerspective ? 'Perspective' : 'Orthographic';
+  document.getElementById('btnProjection').disabled = !state.loaded;
 
   document.getElementById('btnSelTris').className = 'tri-active';
   document.getElementById('btnSelEdges').className = '';
@@ -815,10 +968,13 @@ function updateUI() {
 
 const selRectEl = document.getElementById('selRect');
 let isRectSelecting = false;
+let isPaintSelecting = false;
+let lastPaintTri = -1;
 let rectStartX = 0, rectStartY = 0;
 
-function startRect(event) {
-  if (!mesh || state.mode === 'edge') return;
+function startRect(event, force = false) {
+  if (!mesh) return;
+  if (!force && state.mode === 'edge') return;
   const rect = renderer.domElement.getBoundingClientRect();
   rectStartX = event.clientX - rect.left;
   rectStartY = event.clientY - rect.top;
@@ -852,10 +1008,55 @@ function endRect(event) {
   if (dx > 3 && dy > 3) rectSelect(rectStartX, rectStartY, cx, cy, event);
 }
 
+function endZoomWindow(event) {
+  if (!isRectSelecting) return;
+  isRectSelecting = false;
+  selRectEl.style.display = 'none';
+  controls.enabled = true;
+  isZoomWindowing = false;
+  updateUI();
+  const rect = renderer.domElement.getBoundingClientRect();
+  const cx = event.clientX - rect.left, cy = event.clientY - rect.top;
+  const dx = Math.abs(cx - rectStartX), dy = Math.abs(cy - rectStartY);
+  if (dx < 5 || dy < 5) return;
+  const left = Math.min(rectStartX, cx), right = Math.max(rectStartX, cx);
+  const top = Math.min(rectStartY, cy), bottom = Math.max(rectStartY, cy);
+  const vw = rect.width, vh = rect.height;
+  const ndcCx = (((left + right) / 2) / vw) * 2 - 1;
+  const ndcCy = 1 - (((top + bottom) / 2) / vh) * 2;
+  const raycaster = new THREE.Raycaster();
+  setRaycasterFromCam(raycaster, new THREE.Vector2(ndcCx, ndcCy));
+  const hit = raycaster.intersectObject(mesh);
+  if (hit.length > 0) {
+    controls.target.copy(hit[0].point);
+  } else {
+    const plane = new THREE.Plane();
+    const normal = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+    plane.setFromNormalAndCoplanarPoint(normal, controls.target);
+    const pt = new THREE.Vector3();
+    raycaster.ray.intersectPlane(plane, pt);
+    if (pt) controls.target.copy(pt);
+  }
+  const oldPos = camera.position.clone();
+  const curDist = oldPos.distanceTo(controls.target);
+  const scale = Math.max((right - left) / vw, (bottom - top) / vh);
+  const factor = Math.max(scale, 0.01);
+  const dir = new THREE.Vector3().subVectors(controls.target, oldPos).normalize();
+  camera.position.copy(controls.target).addScaledVector(dir, -curDist * factor);
+  savedCamQuatValid = false;
+  controls._movePrev.copy(controls._moveCurr);
+  controls._lastAngle = 0;
+  controls._zoomStart.copy(controls._zoomEnd);
+  controls._panStart.copy(controls._panEnd);
+  controls.update();
+  updateCenterMarker();
+}
+
 let pointerDownPos = { x: 0, y: 0, time: 0 };
 let isPointerDown = false;
 
 renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (isZoomWindowing && state.loaded) { startRect(e, true); e.preventDefault(); return; }
   pointerDownPos.x = e.clientX;
   pointerDownPos.y = e.clientY;
   pointerDownPos.time = performance.now();
@@ -866,11 +1067,36 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 });
 
 renderer.domElement.addEventListener('pointermove', (e) => {
-  if (isRectSelecting) moveRect(e);
+  if (isRectSelecting) { moveRect(e); return; }
+  if (isPaintSelecting) {
+    if (!e.ctrlKey) { isPaintSelecting = false; controls.enabled = true; return; }
+    paintSelect(e); return;
+  }
+  if (isPointerDown && e.ctrlKey && state.mode === 'select' && state.loaded) {
+    const dx = Math.abs(e.clientX - pointerDownPos.x);
+    const dy = Math.abs(e.clientY - pointerDownPos.y);
+    if (dx > 5 || dy > 5) {
+      isPaintSelecting = true;
+      controls.enabled = false;
+      paintSelect(e);
+    }
+  }
+  if (state.mode === 'edge' && state.loaded) updateEdgeHover(e);
 });
 
+renderer.domElement.addEventListener('pointerleave', clearEdgeHover);
+
 renderer.domElement.addEventListener('pointerup', (e) => {
-  if (isRectSelecting) { endRect(e); isPointerDown = false; return; }
+  if (isRectSelecting) {
+    if (isZoomWindowing) { endZoomWindow(e); isPointerDown = false; return; }
+    endRect(e); isPointerDown = false; return;
+  }
+  if (isPaintSelecting) {
+    isPaintSelecting = false;
+    controls.enabled = true;
+    isPointerDown = false;
+    return;
+  }
   if (!isPointerDown) { isPointerDown = false; return; }
   isPointerDown = false;
   const dx = Math.abs(e.clientX - pointerDownPos.x);
@@ -893,6 +1119,9 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'r' || e.key === 'R') { fitCamera(); }
   if (e.key === 'Escape') {
     cancelCenterPick();
+    if (isZoomWindowing) { isZoomWindowing = false; updateUI(); }
+    if (isRectSelecting) { isRectSelecting = false; selRectEl.style.display = 'none'; controls.enabled = true; }
+    if (isPaintSelecting) { isPaintSelecting = false; controls.enabled = true; }
     if (state.mode !== 'select') setMode('select');
     state.selectedTris.clear();
     state.selectedEdges = [];
@@ -905,7 +1134,23 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'o' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); document.getElementById('fileInput').click(); }
 });
 
-document.getElementById('btnLoad').addEventListener('click', () => { document.getElementById('fileInput').click(); });
+document.getElementById('btnLoad').addEventListener('click', () => {
+  if ('showOpenFilePicker' in window) {
+    (async () => {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: [{ description: 'STL File', accept: { 'model/stl': ['.stl'] } }],
+          multiple: false,
+        });
+        loadFile(await handle.getFile());
+      } catch (e) {
+        if (e.name !== 'AbortError') showToast('Error opening file', true);
+      }
+    })();
+  } else {
+    document.getElementById('fileInput').click();
+  }
+});
 document.getElementById('fileInput').addEventListener('change', (e) => {
   if (e.target.files.length > 0) loadFile(e.target.files[0]);
   e.target.value = '';
@@ -913,6 +1158,7 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
 document.getElementById('btnSave').addEventListener('click', saveFile);
 document.getElementById('btnUndo').addEventListener('click', () => { if (undo()) buildScene(false); updateUI(); });
 document.getElementById('btnCloseHoles').addEventListener('click', closeHoles);
+document.getElementById('btnSplitEdge').addEventListener('click', splitEdge);
 document.getElementById('btnResetView').addEventListener('click', fitCamera);
 
 document.getElementById('btnSelTris').addEventListener('click', () => setMode('select'));
@@ -924,6 +1170,7 @@ function setMode(m) {
   if (m === state.mode) return;
   state.selectedTris.clear();
   state.selectedEdges = [];
+  clearEdgeHover();
   if (edgeLines) { scene.remove(edgeLines); edgeLines.geometry.dispose(); edgeLines = null; }
   state.mode = m;
   buildEdgeLines();
@@ -940,9 +1187,15 @@ document.getElementById('btnSetCenter').addEventListener('click', () => {
   updateUI();
 });
 
+document.getElementById('btnZoomWin').addEventListener('click', () => {
+  if (!state.loaded) return;
+  if (pickingCenter) cancelCenterPick();
+  isZoomWindowing = !isZoomWindowing;
+  if (isZoomWindowing) showToast('Drag a rectangle to zoom');
+  updateUI();
+});
 
-
-
+document.getElementById('btnProjection').addEventListener('click', toggleProjection);
 
 document.getElementById('chkWireframe').addEventListener('change', (e) => {
   showWireframe = e.target.checked;
@@ -957,6 +1210,18 @@ document.getElementById('chkFreeEdges').addEventListener('change', (e) => {
   }
 });
 
+function toggleProjection() {
+  isPerspective = !isPerspective;
+  if (isPerspective) {
+    camera.fov = perspFov;
+    camera.updateProjectionMatrix();
+  } else {
+    perspFov = camera.fov;
+  }
+  updateUI();
+  showToast(isPerspective ? 'Perspective' : 'Orthographic');
+}
+
 function onResize() {
   const w = container.clientWidth, h = container.clientHeight;
   camera.aspect = w / h;
@@ -968,6 +1233,20 @@ window.addEventListener('resize', onResize);
 function animate() {
   requestAnimationFrame(animate);
   controls.update();
+  if (!isPerspective) {
+    const dist = camera.position.distanceTo(controls.target);
+    const aspect = container.clientWidth / container.clientHeight;
+    const fovRad = THREE.MathUtils.degToRad(perspFov);
+    const halfH = Math.max(dist * Math.tan(fovRad / 2), 0.01);
+    const halfW = halfH * aspect;
+    camera.projectionMatrix.makeOrthographic(-halfW, halfW, halfH, -halfH, 0.1, 10000);
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+    camera.fov = perspFov;
+  }
+  const lOff1 = _v.set(10, 20, 15).applyQuaternion(camera.quaternion);
+  dirLight.position.copy(camera.position).add(lOff1);
+  const lOff2 = _v.set(-10, 5, -15).applyQuaternion(camera.quaternion);
+  dirLight2.position.copy(camera.position).add(lOff2);
   if (savedCamQuatValid && controls.state === -1) {
     camera.quaternion.copy(savedCamQuat);
   }
