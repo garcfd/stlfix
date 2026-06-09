@@ -45,7 +45,7 @@ html, body { height: 100%; overflow: hidden; font-family: 'Segoe UI', system-ui,
   <button id="btnUndo" disabled>Undo</button>
   <span class="sep"></span>
   <button id="btnCloseHoles">Close Holes</button>
-  <button id="btnSplitEdge" disabled>Split Edge</button>
+  <button id="btnSplitEdge" disabled>Split</button>
   <span class="sep"></span>
   <button id="btnResetView">Reset View</button>
   <button id="btnZoomWin">Zoom Window</button>
@@ -219,10 +219,11 @@ const history = { stack: [], limit: 50 };
 function pushHistory() {
   history.stack.push({
     vertices: state.vertices.slice(),
-    indices: state.indices.slice(),
+    indices: state.indices.slice()
   });
   if (history.stack.length > history.limit) history.stack.shift();
 }
+
 function undo() {
   if (history.stack.length === 0) return false;
   const prev = history.stack.pop();
@@ -254,7 +255,7 @@ controls.zoomSpeed = 2.0;
 controls.panSpeed = 0.5;
 controls.staticMoving = false;
 controls.dynamicDampingFactor = 0.1;
-controls.minDistance = 1;
+controls.minDistance = 0.01;
 controls.maxDistance = 5000;
 
 const ambientLight = new THREE.AmbientLight(0x8080c0, 1.0);
@@ -991,50 +992,78 @@ function deleteSelected() {
 }
 
 function splitEdge() {
-  if (!mesh || state.mode !== 'edge' || state.selectedEdges.length === 0) return;
-  pushHistory();
-  let totalSplit = 0;
-  const edgesToSplit = state.selectedEdges.slice();
-  for (const ei of edgesToSplit) {
-    const e = state.edges[ei];
-    if (!e) continue;
-    const a = e.a, b = e.b;
-    const ax = state.vertices[a * 3], ay = state.vertices[a * 3 + 1], az = state.vertices[a * 3 + 2];
-    const bx = state.vertices[b * 3], by = state.vertices[b * 3 + 1], bz = state.vertices[b * 3 + 2];
-    const mx = (ax + bx) / 2, my = (ay + by) / 2, mz = (az + bz) / 2;
-    const midIdx = state.vertices.length / 3;
-    state.vertices.push(mx, my, mz);
-    const newIdx = [];
+  if (!mesh || !state.loaded) return;
+  if (state.mode === 'edge' && state.selectedEdges.length > 0) {
+    pushHistory();
+    let totalSplit = 0;
+    const edgesToSplit = state.selectedEdges.slice();
+    for (const ei of edgesToSplit) {
+      const e = state.edges[ei];
+      if (!e) continue;
+      const a = e.a, b = e.b;
+      const ax = state.vertices[a * 3], ay = state.vertices[a * 3 + 1], az = state.vertices[a * 3 + 2];
+      const bx = state.vertices[b * 3], by = state.vertices[b * 3 + 1], bz = state.vertices[b * 3 + 2];
+      const mx = (ax + bx) / 2, my = (ay + by) / 2, mz = (az + bz) / 2;
+      const midIdx = state.vertices.length / 3;
+      state.vertices.push(mx, my, mz);
+      const newIdx = [];
+      const idx = state.indices;
+      const triCount = idx.length / 3;
+      let splitCount = 0;
+      for (let i = 0; i < triCount; i++) {
+        const i0 = idx[i * 3], i1 = idx[i * 3 + 1], i2 = idx[i * 3 + 2];
+        if ((i0 === a && i1 === b) || (i0 === b && i1 === a)) {
+          newIdx.push(i0, midIdx, i2);
+          newIdx.push(midIdx, i1, i2);
+          splitCount++;
+        } else if ((i1 === a && i2 === b) || (i1 === b && i2 === a)) {
+          newIdx.push(i0, i1, midIdx);
+          newIdx.push(i0, midIdx, i2);
+          splitCount++;
+        } else if ((i2 === a && i0 === b) || (i2 === b && i0 === a)) {
+          newIdx.push(i1, i2, midIdx);
+          newIdx.push(i1, midIdx, i0);
+          splitCount++;
+        } else {
+          newIdx.push(i0, i1, i2);
+        }
+      }
+      state.indices = newIdx;
+      totalSplit += splitCount;
+    }
+    if (totalSplit === 0) { showToast('No edges found', true); return; }
+    state.selectedEdges = [];
+    state.selectedTris.clear();
+    state.dirty = true;
+    showToast('Split ' + edgesToSplit.length + ' edge(s), ' + totalSplit + ' triangle(s) subdivided');
+    buildScene(false);
+  } else if (state.mode === 'select' && state.selectedTris.size > 0) {
+    pushHistory();
+    const sorted = [...state.selectedTris].sort((a, b) => a - b);
     const idx = state.indices;
     const triCount = idx.length / 3;
-    let splitCount = 0;
+    const newIdx = [];
     for (let i = 0; i < triCount; i++) {
-      const i0 = idx[i * 3], i1 = idx[i * 3 + 1], i2 = idx[i * 3 + 2];
-      if ((i0 === a && i1 === b) || (i0 === b && i1 === a)) {
-        newIdx.push(i0, midIdx, i2);
-        newIdx.push(midIdx, i1, i2);
-        splitCount++;
-      } else if ((i1 === a && i2 === b) || (i1 === b && i2 === a)) {
-        newIdx.push(i0, i1, midIdx);
-        newIdx.push(i0, midIdx, i2);
-        splitCount++;
-      } else if ((i2 === a && i0 === b) || (i2 === b && i0 === a)) {
-        newIdx.push(i1, i2, midIdx);
-        newIdx.push(i1, midIdx, i0);
-        splitCount++;
+      const st = sorted.indexOf(i);
+      if (st >= 0) {
+        const i0 = idx[i * 3], i1 = idx[i * 3 + 1], i2 = idx[i * 3 + 2];
+        const cx = (state.vertices[i0 * 3] + state.vertices[i1 * 3] + state.vertices[i2 * 3]) / 3;
+        const cy = (state.vertices[i0 * 3 + 1] + state.vertices[i1 * 3 + 1] + state.vertices[i2 * 3 + 1]) / 3;
+        const cz = (state.vertices[i0 * 3 + 2] + state.vertices[i1 * 3 + 2] + state.vertices[i2 * 3 + 2]) / 3;
+        const m = state.vertices.length / 3;
+        state.vertices.push(cx, cy, cz);
+        newIdx.push(i0, i1, m, i1, i2, m, i2, i0, m);
       } else {
-        newIdx.push(i0, i1, i2);
+        newIdx.push(idx[i * 3], idx[i * 3 + 1], idx[i * 3 + 2]);
       }
     }
+    const n = sorted.length;
     state.indices = newIdx;
-    totalSplit += splitCount;
+    state.selectedTris.clear();
+    state.dirty = true;
+    showToast('Split ' + n + ' triangle(s) into ' + (n * 3) + ' triangles');
+    buildScene(false);
   }
-  if (totalSplit === 0) { showToast('No edges found', true); return; }
-  state.selectedEdges = [];
-  state.selectedTris.clear();
-  state.dirty = true;
-  showToast('Split ' + edgesToSplit.length + ' edge(s), ' + totalSplit + ' triangle(s) subdivided');
-  buildScene(false);
 }
 
 async function loadFile(file) {
@@ -1111,9 +1140,11 @@ function updateUI() {
   document.getElementById('btnUndo').disabled = history.stack.length === 0;
   document.getElementById('btnSetCenter').disabled = !state.loaded;
   document.getElementById('btnSetCenter').className = pickingCenter ? 'active' : '';
-
   document.getElementById('btnCloseHoles').disabled = !state.loaded;
-  document.getElementById('btnSplitEdge').disabled = !state.loaded || state.mode !== 'edge' || state.selectedEdges.length === 0;
+  document.getElementById('btnSplitEdge').disabled = !state.loaded ||
+    (state.mode === 'edge' && state.selectedEdges.length === 0) ||
+    (state.mode === 'select' && state.selectedTris.size === 0) ||
+    (state.mode !== 'edge' && state.mode !== 'select');
 
   document.getElementById('btnZoomWin').className = isZoomWindowing ? 'active' : '';
   document.getElementById('btnZoomWin').disabled = !state.loaded;
@@ -1255,6 +1286,9 @@ renderer.domElement.addEventListener('pointermove', (e) => {
 
 renderer.domElement.addEventListener('pointerleave', () => { clearEdgeHover(); clearTriHover(); });
 
+renderer.domElement.addEventListener('pointercancel', () => {});
+
+
 renderer.domElement.addEventListener('pointerup', (e) => {
   if (isRectSelecting) {
     if (isZoomWindowing) { endZoomWindow(e); isPointerDown = false; return; }
@@ -1385,7 +1419,7 @@ document.getElementById('chkFreeEdges').addEventListener('change', (e) => {
 function toggleProjection() {
   isPerspective = !isPerspective;
   if (isPerspective) {
-    controls.minDistance = 1;
+    controls.minDistance = 0.01;
     camera.updateProjectionMatrix();
   } else {
     controls.minDistance = 0.1;
