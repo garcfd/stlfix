@@ -55,6 +55,7 @@ html, body { height: 100%; overflow: hidden; font-family: 'Segoe UI', system-ui,
   <button id="btnSelTris" class="tri-active">Select Tris</button>
   <button id="btnSelEdges">Select Edges</button>
   <span class="sep"></span>
+  <label><input type="checkbox" id="chkShowEdges"> Edges</label>
   <label><input type="checkbox" id="chkWireframe"> Wire</label>
   <label><input type="checkbox" id="chkFreeEdges"> Free Edges</label>
   <span class="info" id="infoText">No file</span>
@@ -208,6 +209,7 @@ const state = {
   dirty: false,
   loaded: false,
 };
+let showEdges = false;
 let showFreeEdges = false;
 let showWireframe = false;
 let pickingCenter = false;
@@ -307,7 +309,7 @@ const matHighlight = new THREE.MeshStandardMaterial({
 const matEdge = new THREE.LineBasicMaterial({ color: 0x222222 });
 const matEdgeSel = new THREE.LineBasicMaterial({ color: 0xffaa00 });
 const matFreeEdge = new THREE.LineBasicMaterial({ color: 0xff3333 });
-const matWireframe = new THREE.LineBasicMaterial({ color: 0xffffff });
+const matWireframe = new THREE.LineBasicMaterial({ color: 0x88ccff });
 const matEdgeHover = new THREE.LineBasicMaterial({ color: 0x00ff88 });
 
 const matTriHover = new THREE.MeshStandardMaterial({
@@ -379,7 +381,7 @@ function buildEdgeLines() {
     if (count < 2) freeEdgePos.push(x1, y1, z1, x2, y2, z2);
   }
 
-  if (edgePos.length > 0 && !showWireframe) {
+  if (edgePos.length > 0 && !showWireframe && showEdges) {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(edgePos, 3));
     edgeLines = new THREE.LineSegments(geo, matEdge);
@@ -1402,6 +1404,11 @@ document.getElementById('btnZoomWin').addEventListener('click', () => {
 });
 
 document.getElementById('btnProjection').addEventListener('click', toggleProjection);
+
+document.getElementById('chkShowEdges').addEventListener('change', (e) => {
+  showEdges = e.target.checked;
+  if (mesh) buildEdgeLines();
+});
 
 document.getElementById('chkWireframe').addEventListener('change', (e) => {
   showWireframe = e.target.checked;
